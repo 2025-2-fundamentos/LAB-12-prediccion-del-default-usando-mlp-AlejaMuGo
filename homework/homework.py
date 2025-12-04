@@ -96,3 +96,151 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import gzip
+import json
+import os
+import pickle
+from pathlib import Path
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def cargarDataset(rutaArchivo: str) -> pd.DataFrame:
+    return pd.read_csv(rutaArchivo, compression="zip").copy()
+
+
+def limpiarDatos(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.rename(columns={"default payment next month": "default"})
+    if "ID" in df.columns:
+        df = df.drop(columns=["ID"])
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)]
+    df.loc[df["EDUCATION"] >= 4, "EDUCATION"] = 4
+    df = df.dropna()
+    return df
+
+
+def dividirCaracteristicasYObjetivo(df: pd.DataFrame):
+    x = df.drop(columns=["default"])
+    y = df["default"]
+    return x, y
+
+
+def construirPipeline(caracteristicasCategoricas, caracteristicasNumericas) -> Pipeline:
+    transformers = [
+        ("categorical", OneHotEncoder(), caracteristicasCategoricas),
+        ("numeric", StandardScaler(), caracteristicasNumericas),
+    ]
+    preprocessor = ColumnTransformer(transformers=transformers)
+
+    selector = SelectKBest(score_func=f_classif)
+    pca = PCA()
+    classifier = MLPClassifier(max_iter=15000, random_state=21)
+
+    pipe = Pipeline(
+        steps=[("preprocessor", preprocessor), ("selector", selector), ("pca", pca), ("mlp", classifier)]
+    )
+    return pipe
+
+
+def obtenerModeloDeBusqueda(pipe: Pipeline) -> GridSearchCV:
+    paramGrid = {
+        "selector__k": [20],
+        "pca__n_components": [None],
+        "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "mlp__alpha": [0.26],
+        "mlp__learning_rate_init": [0.001],
+    }
+
+    search = GridSearchCV(
+        estimator=pipe,
+        param_grid=paramGrid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+    )
+    return search
+
+
+def guardarModelo(modelo, rutaModelo: str):
+    os.makedirs(os.path.dirname(rutaModelo), exist_ok=True)
+    with gzip.open(rutaModelo, "wb") as f:
+        pickle.dump(modelo, f)
+
+
+def obtenerDiccionarioMetricas(yVerdaderas, yPredicciones, nombreDataset: str) -> dict:
+    return {
+        "type": "metrics",
+        "dataset": nombreDataset,
+        "precision": precision_score(yVerdaderas, yPredicciones, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(yVerdaderas, yPredicciones),
+        "recall": recall_score(yVerdaderas, yPredicciones, zero_division=0),
+        "f1_score": f1_score(yVerdaderas, yPredicciones, zero_division=0),
+    }
+
+
+def obtenerDiccionarioConfusion(yVerdaderas, yPredicciones, nombreDataset: str) -> dict:
+    tn, fp, fn, tp = confusion_matrix(yVerdaderas, yPredicciones).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": nombreDataset,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+def escribirArchivoMetricas(registros, rutaSalida: str):
+    Path(os.path.dirname(rutaSalida)).mkdir(parents=True, exist_ok=True)
+    with open(rutaSalida, "w", encoding="utf-8") as f:
+        for row in registros:
+            f.write(json.dumps(row) + "\n")
+
+
+def ejecutar():
+    trainDf = cargarDataset("files/input/train_data.csv.zip")
+    testDf = cargarDataset("files/input/test_data.csv.zip")
+
+    trainDf = limpiarDatos(trainDf)
+    testDf = limpiarDatos(testDf)
+
+    xTrain, yTrain = dividirCaracteristicasYObjetivo(trainDf)
+    xTest, yTest = dividirCaracteristicasYObjetivo(testDf)
+
+    columnasCategoricas = ["SEX", "EDUCATION", "MARRIAGE"]
+    columnasNumericas = [col for col in xTrain.columns if col not in columnasCategoricas]
+
+    pipeline = construirPipeline(columnasCategoricas, columnasNumericas)
+    searchModel = obtenerModeloDeBusqueda(pipeline)
+    searchModel.fit(xTrain, yTrain)
+
+    guardarModelo(searchModel, "files/models/model.pkl.gz")
+
+    yTrainPred = searchModel.predict(xTrain)
+    yTestPred = searchModel.predict(xTest)
+
+    trainMetrics = obtenerDiccionarioMetricas(yTrain, yTrainPred, "train")
+    testMetrics = obtenerDiccionarioMetricas(yTest, yTestPred, "test")
+
+    trainCm = obtenerDiccionarioConfusion(yTrain, yTrainPred, "train")
+    testCm = obtenerDiccionarioConfusion(yTest, yTestPred, "test")
+
+    registros = [trainMetrics, testMetrics, trainCm, testCm]
+    escribirArchivoMetricas(registros, "files/output/metrics.json")
+
+
+if __name__ == "__main__":
+    ejecutar()
+
